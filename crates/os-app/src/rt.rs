@@ -112,15 +112,15 @@ pub fn promote(tid: i32) -> Result<(), String> {
         // priority.
         let _ = std::thread::Builder::new().name("rt watchdog".into()).spawn(watch);
     });
-    // Again at every promotion: the kernel raises the soft cap by a second at each SIGXCPU, which would leave the hard
-    // one to kill the program next time.
-    cap_rttime();
     // Known before it is real-time: a SIGXCPU while rtkit answers must find it.
     remember(tid);
     let param = libc::sched_param { sched_priority: PRIORITY };
     // SAFETY: sets the scheduling policy of a thread of this process.
     let direct = unsafe { libc::sched_setscheduler(tid, libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK, &param) } == 0;
     if !direct {
+        // RTKit requires this limit; direct scheduling does not.
+        // Keep it out of Wine plugin processes when direct scheduling succeeds.
+        cap_rttime();
         rtkit(tid).inspect_err(|_| {
             REFUSED.fetch_add(1, Ordering::AcqRel);
         })?;
