@@ -288,6 +288,24 @@ pub fn find_native(list: &[Available], file_id: &str) -> Option<usize> {
     list.iter().position(|a| a.desc.format == Format::Native && a.desc.id.eq_ignore_ascii_case(file_id))
 }
 
+fn find_native_or_clap(list: &[Available], name: &str, native: bool) -> Option<usize> {
+    native.then(|| find_native(list, name)).flatten().or_else(|| {
+        list.iter().position(|a| a.desc.format == Format::Clap && a.desc.name.eq_ignore_ascii_case(name))
+    })
+}
+
+fn native_clap_state(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    // This state layout carries a native-host flag that the CLAP loader rejects.
+    const SIGNATURE: &[u8] = &[0xf8, 0x3e, 0, 0, 0xab, 0xe1, 0x3a, 0x97, 0x1b, 0x5d, 0x7b, 7];
+    if data.len() >= 24 && data.starts_with(SIGNATURE) && data[19] & 0x80 != 0 {
+        let mut state = data.to_vec();
+        state[19] &= 0x7f;
+        std::borrow::Cow::Owned(state)
+    } else {
+        std::borrow::Cow::Borrowed(data)
+    }
+}
+
 /// A hint-bar list of plugin names: sorted, each once, at most `max` named.
 fn name_list(mut names: Vec<String>, max: usize) -> String {
     names.sort();
@@ -420,12 +438,21 @@ impl crate::app::App {
         }
     }
 
-    /// With the experimental native host on (Settings > Plugins), the native plugins an opened project names are
-    /// hosted by the installed plugins themselves (spec: plugins/fruity-abi.md "Opened projects"): see `host_native`.
+    /// Native plugins use the experimental native host when enabled, or an installed CLAP counterpart.
     pub(crate) fn sync_native(&mut self) {
-        if os_native::enabled() {
-            self.host_native();
+        self.host_native_formats(os_native::enabled());
+    }
+
+    fn load_native_clap(&mut self, key: usize, state: Option<&[u8]>) -> Result<(), String> {
+        if self.plugins.descriptor(key).is_some_and(|d| d.format == Format::Clap) {
+            if let Some(state) = state.filter(|s| !s.is_empty()) {
+                if !self.plugins.set_state(key, &native_clap_state(state)) {
+                    self.plugins.drop_key(key);
+                    return Err("CLAP plugin rejected the saved native state".into());
+                }
+            }
         }
+        Ok(())
     }
 
     /// Hosts every plugin channel and filled mixer slot that names a native plugin (its file id, event 201) and has
@@ -435,6 +462,10 @@ impl crate::app::App {
     /// once the scan is over and kept in the project; one that does not start is reported and kept too. An instance
     /// that does not give the file's state back byte for byte keeps the file's bytes on a save (`Hosted::keep_file_state`).
     pub(crate) fn host_native(&mut self) {
+        self.host_native_formats(true);
+    }
+
+    fn host_native_formats(&mut self, native: bool) {
         use crate::plugins::fx_key;
         let scanning = self.sweep.is_some();
         let pending = self.state.pending_plugin.map(|(r, _)| r);
@@ -450,6 +481,9 @@ impl crate::app::App {
                     return None;
                 }
                 let name = ch.plugin.as_deref().filter(|n| ch.kind == ChannelKind::Plugin && !n.is_empty() && *n != WRAPPER)?;
+                if !native && find_native_or_clap(&self.plugins.available, name, false).is_none() {
+                    return None;
+                }
                 Some((r, name.to_string(), ch.plugin_state.clone()))
             })
             .collect();
@@ -457,7 +491,7 @@ impl crate::app::App {
             if self.past_deadline() {
                 break;
             }
-            let Some(i) = find_native(&self.plugins.available, &name) else {
+            let Some(i) = find_native_or_clap(&self.plugins.available, &name, native) else {
                 if !scanning {
                     self.native_failed.push(row);
                     missing.push(name);
@@ -467,11 +501,15 @@ impl crate::app::App {
             if !self.plugins.instrument_ready(i) {
                 continue;
             }
-            match self.plugins.create_with(row, i, state.as_deref().filter(|s| !s.is_empty())) {
+            let clap = self.plugins.available[i].desc.format == Format::Clap;
+            let start = if clap { None } else { state.as_deref().filter(|s| !s.is_empty()) };
+            let made = self.plugins.create_with(row, i, start)
+                .and_then(|name| self.load_native_clap(row, state.as_deref()).map(|()| name));
+            match made {
                 Ok(_) => {
                     self.state.hosted_rows.push(row);
                     added.0 = true;
-                    if !self.native_round_trips(row, state.as_deref()) {
+                    if !clap && !self.native_round_trips(row, state.as_deref()) {
                         kept.push(name.clone());
                     }
                     hosted.push(name);
@@ -492,6 +530,7 @@ impl crate::app::App {
             .filter(|&(t, k, s)| {
                 let key = fx_key(t, k);
                 !s.name.is_empty() && s.name != WRAPPER && s.name != crate::container::CONTAINER && !self.plugins.hosted.contains_key(&key) && !self.native_failed.contains(&key)
+                    && (native || find_native_or_clap(&self.plugins.effects, &s.name, false).is_some())
             })
             .map(|(t, k, s)| (t, k, s.name.clone(), s.state.clone()))
             .collect();
@@ -500,7 +539,7 @@ impl crate::app::App {
                 break;
             }
             let key = fx_key(t, k);
-            let Some(i) = find_native(&self.plugins.effects, &name) else {
+            let Some(i) = find_native_or_clap(&self.plugins.effects, &name, native) else {
                 if !scanning {
                     self.native_failed.push(key);
                     missing.push(name);
@@ -510,10 +549,14 @@ impl crate::app::App {
             if !self.plugins.effect_ready(i) {
                 continue;
             }
-            match self.plugins.create_effect(t, k, i, (!state.is_empty()).then_some(state.as_slice())) {
+            let clap = self.plugins.effects[i].desc.format == Format::Clap;
+            let start = if clap { None } else { (!state.is_empty()).then_some(state.as_slice()) };
+            let made = self.plugins.create_effect(t, k, i, start)
+                .and_then(|name| self.load_native_clap(key, Some(&state)).map(|()| name));
+            match made {
                 Ok(_) => {
                     added.1 = true;
-                    if !self.native_round_trips(key, Some(&state)) {
+                    if !clap && !self.native_round_trips(key, Some(&state)) {
                         kept.push(name.clone());
                     }
                     hosted.push(name);
