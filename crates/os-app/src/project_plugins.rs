@@ -257,13 +257,14 @@ fn same_file(a: &std::path::Path, b: &str) -> bool {
     a.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(b))
 }
 
-/// The plugin of `list` a wrapped plugin names: the same format and class id, else the same file and name, else the
-/// same format and name, else the same name (a copy in another format, which does not get the saved state:
-/// [`switched_format`]).
+/// The plugin of `list` a wrapped plugin names: the same format and class id (in either GUID byte order), else the same file and name, else the
+/// same format and name, else the same name (a copy in another format; [`starting_state`] decides whether its state
+/// is compatible).
 pub fn find(list: &[Available], r: &PluginRef) -> Option<usize> {
     let format = Format::parse(&r.format);
-    let tests: [&dyn Fn(&Descriptor) -> bool; 4] = [
+    let tests: [&dyn Fn(&Descriptor) -> bool; 5] = [
         &|d| !r.id.is_empty() && Some(d.format) == format && d.id.eq_ignore_ascii_case(&r.id),
+        &|d| d.format == Format::Vst3 && format == Some(Format::Vst3) && swapped_vst3_id(&d.id, &r.id),
         &|d| !r.path.is_empty() && same_file(&d.path, &r.path) && d.name == r.name,
         &|d| Some(d.format) == format && d.name == r.name,
         &|d| d.name == r.name,
@@ -271,14 +272,40 @@ pub fn find(list: &[Available], r: &PluginRef) -> Option<usize> {
     tests.iter().find_map(|t| list.iter().position(|a| t(&a.desc)))
 }
 
+fn swapped_vst3_id(a: &str, b: &str) -> bool {
+    if a.len() != 32 || b.len() != 32 {
+        return false;
+    }
+    let (Ok(a), Ok(b)) = (u128::from_str_radix(a, 16), u128::from_str_radix(b, 16)) else { return false };
+    let mut b = b.to_be_bytes();
+    // Windows COM GUIDs reverse the first three fields relative to Linux/macOS FUIDs.
+    b[..4].reverse();
+    b[4..6].reverse();
+    b[6..8].reverse();
+    a.to_be_bytes() == b
+}
+
 /// When `d`, found for wrapped plugin `r`, is its copy in another format: what the hint bar says about it ("Kars (VST2
 /// as CLAP)"). The saved state is the other format's, which a copy may take without reading it the same way, so the
-/// copy starts from its defaults instead. The very file the project names is that plugin, whatever format its
+/// copy starts from its defaults unless `starting_state` knows a compatible layout. The very file the project names is that plugin, whatever format its
 /// extension suggested (spec: flp/events/plugins.md §4).
 pub fn switched_format(d: &Descriptor, r: &PluginRef) -> Option<String> {
     let saved = Format::parse(&r.format)?;
     let same = saved == d.format || (!r.path.is_empty() && same_file(&d.path, &r.path));
     (!same).then(|| format!("{} ({} as {})", r.name, format_name(saved), format_name(d.format)))
+}
+
+fn starting_state<'a>(d: &Descriptor, r: &'a PluginRef) -> Option<std::borrow::Cow<'a, [u8]>> {
+    if switched_format(d, r).is_none() {
+        return Some(std::borrow::Cow::Borrowed(&r.state));
+    }
+    // Try the matching VST3 plugin's original VST2 chunk without FL's wrapper header.
+    if r.format == "vst2" && d.format == Format::Vst3 {
+        if let Some(os_vst2::state::Saved::Chunk(chunk)) = os_vst2::state::Saved::parse(&r.state, true) {
+            return (!chunk.is_empty()).then_some(std::borrow::Cow::Owned(chunk));
+        }
+    }
+    None
 }
 
 /// The native plugin of `list` that a project names by its file id (event 201 = the plugin's folder name, which is
@@ -316,7 +343,7 @@ pub fn slot_title(s: &SlotPlugin) -> String {
 impl crate::app::App {
     /// Hosts the wrapped plugins of an opened project (spec: flp/events/plugins.md §4): each wrapped channel and slot
     /// whose plugin is found starts from the state the file holds, or from its defaults when only a copy in another
-    /// format is found (the hint bar names those; a save keeps the file's wrapper for them until they are changed,
+    /// format with no known compatible state is found (the hint bar names those; a save keeps the file's wrapper for them until they are changed,
     /// `Hosted::stand_in`). A plugin that is not found keeps its saved data (written back unchanged) and is not looked
     /// for again.
     pub(crate) fn sync_wrapped(&mut self) {
@@ -333,8 +360,8 @@ impl crate::app::App {
             }
             let made = find(&self.plugins.available, &r).map(|i| {
                 let other = switched_format(&self.plugins.available[i].desc, &r);
-                let state = other.is_none().then_some(r.state.as_slice());
-                (other, self.plugins.create_with(row, i, state))
+                let state = starting_state(&self.plugins.available[i].desc, &r);
+                (other, self.plugins.create_with(row, i, state.as_deref()))
             });
             match made {
                 Some((other, Ok(_))) => {
@@ -375,8 +402,8 @@ impl crate::app::App {
             }
             let made = find(&self.plugins.effects, &r).map(|i| {
                 let other = switched_format(&self.plugins.effects[i].desc, &r);
-                let state = other.is_none().then_some(r.state.as_slice());
-                (other, self.plugins.create_effect(t, k, i, state))
+                let state = starting_state(&self.plugins.effects[i].desc, &r);
+                (other, self.plugins.create_effect(t, k, i, state.as_deref()))
             });
             match made {
                 Some((other, Ok(_))) => {
